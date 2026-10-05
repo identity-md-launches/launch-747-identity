@@ -1,0 +1,25 @@
+{
+  "kind": "custom_token",
+  "token": {
+    "contract": "IdentityToken",
+    "name": "Identity",
+    "symbol": "ID",
+    "decimals": 18,
+    "constructorArgs": [
+      "$factory",
+      "$poolManager",
+      "$launchNumber",
+      "0x0000000000000000000000000000000000000000"
+    ],
+    "totalSupply": "1000000000000000000000000000"
+  },
+  "contracts": [],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "792281625142643375935439503360000"
+  },
+  "economics": {"poolBps":8000,"initialMarketCapWei":"10000000000000000000","remainderTo":"0x70bcbde387539d95ffe6d43edbf7c6aa2da87a09"},
+  "notes": "IdentityToken mints 1,000,000,000 ID with 18 decimals once to msg.sender in its constructor. The zero feeRecipient argument selects msg.sender, which is the factory during this launch, to receive the 8% fee on ordinary transfers, rounded down and deducted from the transferred amount. Transfers involving the factory, pool manager, current fee recipient, or distributor resolved through factory.distributorOf(launchNumber) are fee-exempt. Only the current fee recipient can change the fee recipient. There are no additional application contracts or initialization calls. Native ETH is currency0 and ID is currency1; initialPrice records sqrt(totalSupply / initialMarketCapWei) * 2^96. This price is provenance only; the deployer derives the opening price from the supplied economics and totalSupply."
+}
