@@ -211,7 +211,10 @@ contract IdentityTokenTest is Test {
         } else {
             assertEq(fromBefore - token.balanceOf(from), fee, "a self-transfer costs only the fee");
         }
-        assertLe(token.balanceOf(from) + token.balanceOf(to) + token.balanceOf(REQUESTER), SUPPLY);
+        // Count each holder once: `from` and `to` may alias on a self-transfer.
+        uint256 held = token.balanceOf(address(factory)) + token.balanceOf(from) + token.balanceOf(REQUESTER);
+        if (from != to) held += token.balanceOf(to);
+        assertEq(held, SUPPLY, "all balances still account for the entire supply");
     }
 
     // ---------------------------------------------------------------------------------------------
