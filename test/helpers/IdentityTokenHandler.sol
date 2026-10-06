@@ -7,8 +7,8 @@ import {IdentityToken} from "src/IdentityToken.sol";
 contract IdentityInvariantFactory {
     mapping(uint64 => address) public distributorOf;
 
-    function deploy(address manager) external returns (IdentityToken) {
-        return new IdentityToken(address(this), manager, 7, address(0));
+    function deploy(address manager, address feeRecipient) external returns (IdentityToken) {
+        return new IdentityToken(address(this), manager, 7, feeRecipient);
     }
 
     function setDistributor(address distributor) external {
@@ -28,6 +28,7 @@ contract IdentityTokenHandler is Test {
     mapping(address => uint256) public expectedBalance;
     mapping(address => mapping(address => uint256)) public expectedAllowance;
     address public expectedRecipient;
+    address public expectedPending;
     address public expectedDistributor;
 
     constructor() {
@@ -42,8 +43,10 @@ contract IdentityTokenHandler is Test {
             address(0xCA201),
             address(0xDA7E)
         ];
-        token = factory.deploy(actors[1]);
-        expectedRecipient = address(factory);
+        // Under a launch the constructor refuses a zero recipient, so the requester (an ordinary
+        // actor, not the factory) is named explicitly, as the manifest would name it.
+        token = factory.deploy(actors[1], actors[7]);
+        expectedRecipient = actors[7];
         expectedDistributor = actors[2];
         factory.setDistributor(expectedDistributor);
         expectedBalance[address(factory)] = SUPPLY;
@@ -91,11 +94,38 @@ contract IdentityTokenHandler is Test {
         _approve(_actor(ownerSeed), _actor(spenderSeed), amount);
     }
 
-    function changeFeeRecipient(uint256 recipientSeed) public {
+    /// @dev Step one of the hand-off: only a proposal. The ghost recipient does not move, so every
+    ///      fee paid before acceptance must still land with the current recipient.
+    function proposeFeeRecipient(uint256 recipientSeed) public {
         address next = _actor(recipientSeed);
         vm.prank(expectedRecipient);
         token.setFeeRecipient(next);
-        expectedRecipient = next;
+        expectedPending = next;
+    }
+
+    /// @dev Step two: the proposed address takes the role. With nothing pending, the current
+    ///      recipient itself is refused, so a stale or absent proposal can never move the role.
+    function acceptFeeRecipient() public {
+        address pending = expectedPending;
+        if (pending == address(0)) {
+            vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, expectedRecipient));
+            vm.prank(expectedRecipient);
+            token.acceptFeeRecipient();
+            return;
+        }
+        vm.prank(pending);
+        token.acceptFeeRecipient();
+        expectedRecipient = pending;
+        expectedPending = address(0);
+    }
+
+    /// @dev Anyone who is not the proposed address is refused, whether or not a proposal is open.
+    function rejectInvalidAcceptance(uint256 callerSeed) public {
+        address caller = _actor(callerSeed);
+        if (caller == expectedPending) caller = OUTSIDER;
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, caller));
+        vm.prank(caller);
+        token.acceptFeeRecipient();
     }
 
     function changeDistributor(uint256 seed) public {
@@ -153,8 +183,11 @@ contract IdentityTokenHandler is Test {
             vm.prank(expectedRecipient);
             token.setFeeRecipient(address(0));
         } else {
-            vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotFeeRecipient.selector, OUTSIDER));
-            vm.prank(OUTSIDER);
+            // A stranger, and a proposed-but-not-yet-accepted address, may not propose.
+            address caller =
+                expectedPending == address(0) || expectedPending == expectedRecipient ? OUTSIDER : expectedPending;
+            vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotFeeRecipient.selector, caller));
+            vm.prank(caller);
             token.setFeeRecipient(_actor(nextSeed));
         }
     }

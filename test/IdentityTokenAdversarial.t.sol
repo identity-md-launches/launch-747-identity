@@ -213,14 +213,34 @@ contract IdentityTokenAdversarialTest is Test {
     }
 
     function test_feeRecipientHandoffPreservesHoldingsAndRevokesOldAuthority() public {
-        token.transfer(ALICE, 100);
+        token.transfer(ALICE, 200);
         token.setFeeRecipient(BOB);
-        assertEq(token.balanceOf(ALICE), 100);
+        assertEq(token.feeRecipient(), address(this), "a proposal alone does not move the role");
+        assertEq(token.pendingFeeRecipient(), BOB);
+        assertEq(token.balanceOf(ALICE), 200);
         assertEq(token.balanceOf(BOB), 0);
-        assertEq(token.balanceOf(address(this)), SUPPLY - 100);
+        assertEq(token.balanceOf(address(this)), SUPPLY - 200);
+
+        // Until BOB accepts, the deployer keeps the stream and its exemption, and BOB has neither.
+        vm.prank(ALICE);
+        token.transfer(address(this), 100);
+        assertEq(token.balanceOf(address(this)), SUPPLY - 100, "the current recipient is still exempt");
+        assertEq(token.balanceOf(BOB), 0, "a proposed recipient collects nothing");
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotFeeRecipient.selector, BOB));
+        token.setFeeRecipient(SPENDER);
+
+        vm.prank(BOB);
+        token.acceptFeeRecipient();
+        assertEq(token.feeRecipient(), BOB);
+        assertEq(token.pendingFeeRecipient(), address(0), "acceptance clears the proposal");
         bytes32 before = _state();
         vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotFeeRecipient.selector, address(this)));
         token.setFeeRecipient(SPENDER);
+        assertEq(_state(), before);
+        // The old recipient cannot take the role back through a stale acceptance either.
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, address(this)));
+        token.acceptFeeRecipient();
         assertEq(_state(), before);
 
         // In a direct deployment the old recipient has no other exemption.
@@ -231,8 +251,69 @@ contract IdentityTokenAdversarialTest is Test {
         assertEq(token.balanceOf(BOB), 8);
         vm.prank(BOB);
         token.setFeeRecipient(SPENDER);
+        assertEq(token.feeRecipient(), BOB, "the role stays until the proposed address accepts");
+        vm.prank(SPENDER);
+        token.acceptFeeRecipient();
         assertEq(token.feeRecipient(), SPENDER);
         assertEq(token.balanceOf(BOB), 8, "handoff does not move past fees");
+    }
+
+    function test_acceptWithNothingPendingIsRefusedForEveryone() public {
+        assertEq(token.pendingFeeRecipient(), address(0));
+        bytes32 before = _state();
+        address[4] memory callers = [address(this), ALICE, address(0), address(token)];
+        for (uint256 i; i < callers.length; ++i) {
+            vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, callers[i]));
+            vm.prank(callers[i]);
+            token.acceptFeeRecipient();
+        }
+        assertEq(_state(), before);
+    }
+
+    function test_laterProposalReplacesEarlierOneAndTheEarlierProposeeIsRefused() public {
+        token.setFeeRecipient(BOB);
+        token.setFeeRecipient(SPENDER);
+        assertEq(token.pendingFeeRecipient(), SPENDER);
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, BOB));
+        vm.prank(BOB);
+        token.acceptFeeRecipient();
+        assertEq(token.feeRecipient(), address(this));
+        vm.prank(SPENDER);
+        token.acceptFeeRecipient();
+        assertEq(token.feeRecipient(), SPENDER);
+        // The replaced proposee is not revived by the hand-off.
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, BOB));
+        vm.prank(BOB);
+        token.acceptFeeRecipient();
+    }
+
+    function test_proposalToSelfIsHarmlessAndClearsOnAcceptance() public {
+        token.setFeeRecipient(address(this));
+        assertEq(token.pendingFeeRecipient(), address(this));
+        token.acceptFeeRecipient();
+        assertEq(token.feeRecipient(), address(this));
+        assertEq(token.pendingFeeRecipient(), address(0));
+        // A second acceptance of the same proposal is refused: it was consumed.
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, address(this)));
+        token.acceptFeeRecipient();
+    }
+
+    function test_acceptanceCannotBeReplayedAfterTheRoleMovesOn() public {
+        token.setFeeRecipient(BOB);
+        vm.prank(BOB);
+        token.acceptFeeRecipient();
+        vm.prank(BOB);
+        token.setFeeRecipient(SPENDER);
+        vm.prank(SPENDER);
+        token.acceptFeeRecipient();
+        // BOB's consumed acceptance does not let BOB reclaim the stream from SPENDER.
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, BOB));
+        vm.prank(BOB);
+        token.acceptFeeRecipient();
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotFeeRecipient.selector, BOB));
+        vm.prank(BOB);
+        token.setFeeRecipient(BOB);
+        assertEq(token.feeRecipient(), SPENDER);
     }
 
     function test_feeRecipientCannotSetZeroOrStealUsingTransferFrom() public {

@@ -16,16 +16,18 @@ contract IdentityTokenInvariantTest is Test {
     function setUp() public {
         handler = new IdentityTokenHandler();
         token = handler.token();
-        bytes4[] memory selectors = new bytes4[](9);
+        bytes4[] memory selectors = new bytes4[](11);
         selectors[0] = handler.transfer.selector;
         selectors[1] = handler.transferFrom.selector;
         selectors[2] = handler.approve.selector;
-        selectors[3] = handler.changeFeeRecipient.selector;
-        selectors[4] = handler.changeDistributor.selector;
-        selectors[5] = handler.rejectOverdraw.selector;
-        selectors[6] = handler.rejectDelegatedTransfer.selector;
-        selectors[7] = handler.rejectUnauthorizedPull.selector;
-        selectors[8] = handler.rejectInvalidAdministration.selector;
+        selectors[3] = handler.proposeFeeRecipient.selector;
+        selectors[4] = handler.acceptFeeRecipient.selector;
+        selectors[5] = handler.changeDistributor.selector;
+        selectors[6] = handler.rejectOverdraw.selector;
+        selectors[7] = handler.rejectDelegatedTransfer.selector;
+        selectors[8] = handler.rejectUnauthorizedPull.selector;
+        selectors[9] = handler.rejectInvalidAdministration.selector;
+        selectors[10] = handler.rejectInvalidAcceptance.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
@@ -33,7 +35,8 @@ contract IdentityTokenInvariantTest is Test {
     /// @dev Checked after every random action, including expected failures and role changes.
     function invariant_supplyBalancesAllowancesAndRolesMatchIndependentModel() public view {
         assertEq(token.totalSupply(), SUPPLY, "supply must never mint or burn");
-        assertEq(token.feeRecipient(), handler.expectedRecipient(), "only an authorized handoff changes the role");
+        assertEq(token.feeRecipient(), handler.expectedRecipient(), "only an accepted handoff changes the role");
+        assertEq(token.pendingFeeRecipient(), handler.expectedPending(), "proposal drift");
         assertEq(token.distributor(), handler.expectedDistributor());
         assertEq(token.factory(), address(handler.factory()));
         assertEq(token.poolManager(), handler.actors(1));
@@ -76,8 +79,20 @@ contract IdentityTokenInvariantTest is Test {
         assertEq(token.allowance(handler.actors(5), handler.actors(6)), 0);
         handler.changeDistributor(2);
         handler.transfer(3, 4, 100, 3);
-        handler.changeFeeRecipient(6);
+        // Nothing pending: an acceptance is refused and the role stays put.
+        handler.acceptFeeRecipient();
+        assertEq(token.feeRecipient(), handler.actors(7));
+        handler.proposeFeeRecipient(6);
+        handler.rejectInvalidAdministration(5, false); // the proposee cannot propose yet
+        handler.rejectInvalidAcceptance(6); // the proposee seed is redirected to an outsider
         handler.transfer(4, 5, 100, 3);
+        assertEq(token.balanceOf(handler.actors(6)), SUPPLY / 10, "a pending proposal collects no fee");
+        handler.acceptFeeRecipient();
+        assertEq(token.feeRecipient(), handler.actors(6));
+        assertEq(token.pendingFeeRecipient(), address(0));
+        handler.transfer(4, 5, 100, 3);
+        assertEq(token.balanceOf(handler.actors(6)), SUPPLY / 10 + 8, "the accepted recipient collects the fee");
+        handler.rejectInvalidAcceptance(7); // the old recipient cannot take the role back
         handler.rejectOverdraw(4, 5, type(uint256).max);
         handler.rejectDelegatedTransfer(4, 5, 0);
         handler.rejectDelegatedTransfer(4, 5, 1);
