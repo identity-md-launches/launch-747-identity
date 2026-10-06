@@ -41,6 +41,85 @@ contract MalformedFactory {
     }
 }
 
+/// @dev A factory whose lookup returns a 32-byte word that is not an address (non-zero upper bits).
+contract DirtyWordFactory {
+    fallback() external {
+        assembly {
+            mstore(0, or(shl(160, 1), 0xd157))
+            return(0, 32)
+        }
+    }
+}
+
+/// @dev A factory whose lookup returns more than one word.
+contract OverlongFactory {
+    fallback() external {
+        assembly {
+            mstore(0, 0xd157)
+            mstore(32, 1)
+            return(0, 64)
+        }
+    }
+}
+
+/// @dev The part of Uniswap v4's PoolManager a relay needs: unlock, sync, settle and take, with the
+///      same delta accounting for one currency. v4-core is not vendored here; the call sequence is
+///      the one the real manager exposes to any contract.
+contract PoolManagerStub {
+    IdentityToken private synced;
+    uint256 private reserve;
+    int256 private delta;
+
+    function unlock(bytes calldata data) external returns (bytes memory result) {
+        result = IUnlockCallback(msg.sender).unlockCallback(data);
+        require(delta == 0, "CurrencyNotSettled");
+    }
+
+    function sync(IdentityToken currency) external {
+        synced = currency;
+        reserve = currency.balanceOf(address(this));
+    }
+
+    function settle() external returns (uint256 paid) {
+        paid = synced.balanceOf(address(this)) - reserve;
+        delta += int256(paid);
+    }
+
+    function take(IdentityToken currency, address to, uint256 amount) external {
+        delta -= int256(amount);
+        currency.transfer(to, amount);
+    }
+}
+
+interface IUnlockCallback {
+    function unlockCallback(bytes calldata data) external returns (bytes memory);
+}
+
+/// @dev Any contract can be this: it moves `amount` from the caller to `to` through the manager.
+contract PoolManagerRelay is IUnlockCallback {
+    PoolManagerStub private immutable manager;
+    IdentityToken private immutable token;
+
+    constructor(PoolManagerStub manager_, IdentityToken token_) {
+        manager = manager_;
+        token = token_;
+    }
+
+    function send(address to, uint256 amount) external {
+        manager.unlock(abi.encode(msg.sender, to, amount));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "not the manager");
+        (address from, address to, uint256 amount) = abi.decode(data, (address, address, uint256));
+        manager.sync(token);
+        token.transferFrom(from, address(manager), amount);
+        manager.settle();
+        manager.take(token, to, amount);
+        return "";
+    }
+}
+
 contract IdentityTokenTest is Test {
     uint256 constant SUPPLY = 1_000_000_000e18;
     uint64 constant LAUNCH = 7;
@@ -58,6 +137,7 @@ contract IdentityTokenTest is Test {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
     event FeePaid(address indexed from, address indexed to, uint256 fee);
+    event FeeRecipientProposed(address indexed currentRecipient, address indexed proposedRecipient);
     event FeeRecipientChanged(address indexed previousRecipient, address indexed newRecipient);
 
     function setUp() public {
@@ -99,10 +179,30 @@ contract IdentityTokenTest is Test {
         assertEq(token.distributor(), DISTRIBUTOR);
     }
 
-    function test_feeRecipientDefaultsToDeployer() public {
+    function test_feeRecipientDefaultsToDeployerOutsideALaunch() public {
         IdentityToken direct = new IdentityToken(address(0), address(0), 0, address(0));
         assertEq(direct.feeRecipient(), address(this));
         assertEq(direct.balanceOf(address(this)), SUPPLY);
+    }
+
+    /// @dev Under a launch the deployer is the factory contract, which could neither spend fees nor
+    ///      hand the role on. The constructor refuses to bind the stream to it silently.
+    function test_RevertWhen_launchDeploymentPassesZeroFeeRecipient() public {
+        vm.expectRevert(IdentityToken.InvalidFeeRecipient.selector);
+        factory.deployToken(POOL_MANAGER, LAUNCH, address(0));
+
+        // Any non-zero factory requires an explicit recipient, even outside a launch.
+        vm.expectRevert(IdentityToken.InvalidFeeRecipient.selector);
+        new IdentityToken(address(0xFAC), address(0), 1, address(0));
+    }
+
+    function test_launchDeploymentBindsTheFeeToTheRequesterNotTheFactory() public {
+        _fund(ALICE, 1_000e18);
+        uint256 factoryBefore = token.balanceOf(address(factory));
+        vm.prank(ALICE);
+        token.transfer(BOB, 1_000e18);
+        assertEq(token.balanceOf(address(factory)), factoryBefore, "the factory collected a fee");
+        assertEq(token.balanceOf(REQUESTER), 80e18, "the requester collects the fee");
     }
 
     function test_noMintSurface() public {
@@ -349,28 +449,140 @@ contract IdentityTokenTest is Test {
         assertEq(direct.balanceOf(BOB), 92e18);
     }
 
+    /// @dev A 32-byte answer whose upper 12 bytes are non-zero is not an address. It must read as
+    ///      "no distributor" rather than revert inside abi.decode and brick every transfer.
+    function test_dirtyWordFactoryLookupDoesNotBrickTransfers() public {
+        DirtyWordFactory bad = new DirtyWordFactory();
+        IdentityToken direct = new IdentityToken(address(bad), address(0), 1, address(this));
+        assertEq(direct.distributor(), address(0));
+        direct.transfer(ALICE, 100e18);
+        vm.prank(ALICE);
+        assertTrue(direct.transfer(BOB, 100e18));
+        assertEq(direct.balanceOf(BOB), 92e18);
+        assertEq(direct.balanceOf(address(this)), SUPPLY - 100e18 + 8e18);
+
+        // transferFrom by an approved spender takes the same path.
+        vm.prank(BOB);
+        direct.approve(CAROL, 50e18);
+        vm.prank(CAROL);
+        assertTrue(direct.transferFrom(BOB, ALICE, 50e18));
+        assertEq(direct.balanceOf(ALICE), 46e18);
+        // The low 160 bits (0xd157) are not granted an exemption either.
+        assertFalse(direct.isFeeExempt(address(0xD157), BOB));
+    }
+
+    function test_overlongFactoryAnswerReadsAsNoDistributor() public {
+        OverlongFactory bad = new OverlongFactory();
+        IdentityToken direct = new IdentityToken(address(bad), address(0), 1, address(this));
+        assertEq(direct.distributor(), address(0));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Known limit: the PoolManager is permissionless, so a relay through it is fee-free
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev Documents, rather than prevents, the limit stated in the README: a contract may move ID
+    ///      wallet-to-wallet through the PoolManager's sync/settle/take surface and both legs are
+    ///      exempt, because the token cannot tell that sequence apart from a sell followed by a buy,
+    ///      which the launch requires to move whole. The fee is on transfers that do not pass
+    ///      through the PoolManager. Collecting a fee on pool flows would need a pool hook.
+    function test_knownLimit_relayThroughPoolManagerIsFeeFree() public {
+        PoolManagerStub manager = new PoolManagerStub();
+        IdentityToken launched = factory.deployToken(address(manager), LAUNCH, REQUESTER);
+        factory.move(launched, ALICE, 1_000e18);
+        PoolManagerRelay relay = new PoolManagerRelay(manager, launched);
+
+        vm.prank(ALICE);
+        launched.approve(address(relay), 1_000e18);
+        vm.prank(ALICE);
+        relay.send(BOB, 1_000e18);
+
+        assertEq(launched.balanceOf(BOB), 1_000e18, "both legs touch the PoolManager and are whole");
+        assertEq(launched.balanceOf(REQUESTER), 0, "no fee is collected on a PoolManager relay");
+        assertEq(launched.balanceOf(address(manager)), 0, "the manager keeps nothing");
+
+        // The same wallets pay the fee when they do not route through the PoolManager.
+        vm.prank(BOB);
+        launched.transfer(ALICE, 1_000e18);
+        assertEq(launched.balanceOf(ALICE), 920e18);
+        assertEq(launched.balanceOf(REQUESTER), 80e18);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Fee recipient administration
     // ---------------------------------------------------------------------------------------------
 
-    function test_feeRecipientCanHandOn() public {
+    function test_feeRecipientHandOffIsTwoStep() public {
         vm.expectEmit(true, true, true, true);
-        emit FeeRecipientChanged(REQUESTER, CAROL);
+        emit FeeRecipientProposed(REQUESTER, CAROL);
         vm.prank(REQUESTER);
         token.setFeeRecipient(CAROL);
-        assertEq(token.feeRecipient(), CAROL);
+        assertEq(token.feeRecipient(), REQUESTER, "a proposal does not move the role");
+        assertEq(token.pendingFeeRecipient(), CAROL);
 
+        // Until CAROL accepts, fees keep going to the current recipient.
         _fund(ALICE, 100e18);
         vm.prank(ALICE);
-        token.transfer(BOB, 100e18);
-        assertEq(token.balanceOf(CAROL), 8e18);
-        assertEq(token.balanceOf(REQUESTER), 0);
+        token.transfer(BOB, 50e18);
+        assertEq(token.balanceOf(REQUESTER), 4e18);
+        assertEq(token.balanceOf(CAROL), 0);
+
+        vm.expectEmit(true, true, true, true);
+        emit FeeRecipientChanged(REQUESTER, CAROL);
+        vm.prank(CAROL);
+        token.acceptFeeRecipient();
+        assertEq(token.feeRecipient(), CAROL);
+        assertEq(token.pendingFeeRecipient(), address(0));
+
+        vm.prank(ALICE);
+        token.transfer(BOB, 50e18);
+        assertEq(token.balanceOf(CAROL), 4e18);
+        assertEq(token.balanceOf(REQUESTER), 4e18);
+    }
+
+    function test_mistypedProposalDoesNotStrandTheFeeStream() public {
+        address dead = address(0xdEaD);
+        vm.prank(REQUESTER);
+        token.setFeeRecipient(dead);
+        assertEq(token.feeRecipient(), REQUESTER, "the role stays until the proposed address accepts");
+
+        // The current recipient can replace the proposal before anyone accepts the wrong one.
+        vm.prank(REQUESTER);
+        token.setFeeRecipient(CAROL);
+        assertEq(token.pendingFeeRecipient(), CAROL);
+        vm.prank(dead);
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, dead));
+        token.acceptFeeRecipient();
     }
 
     function test_RevertWhen_strangerSetsFeeRecipient() public {
         vm.prank(ALICE);
         vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotFeeRecipient.selector, ALICE));
         token.setFeeRecipient(ALICE);
+    }
+
+    function test_RevertWhen_strangerAcceptsFeeRecipient() public {
+        vm.prank(REQUESTER);
+        token.setFeeRecipient(CAROL);
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, ALICE));
+        token.acceptFeeRecipient();
+        // Nothing pending at all: the zero address is never a valid caller either.
+        vm.prank(CAROL);
+        token.acceptFeeRecipient();
+        vm.prank(address(0));
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotPendingFeeRecipient.selector, address(0)));
+        token.acceptFeeRecipient();
+    }
+
+    function test_previousRecipientLosesTheRoleAfterAcceptance() public {
+        vm.prank(REQUESTER);
+        token.setFeeRecipient(CAROL);
+        vm.prank(CAROL);
+        token.acceptFeeRecipient();
+        vm.prank(REQUESTER);
+        vm.expectRevert(abi.encodeWithSelector(IdentityToken.NotFeeRecipient.selector, REQUESTER));
+        token.setFeeRecipient(REQUESTER);
     }
 
     function test_RevertWhen_factorySetsFeeRecipient() public {
@@ -464,7 +676,7 @@ contract IdentityTokenTest is Test {
         assertEq(deployed.balanceOf(address(script)), SUPPLY, "minted to the script, the constructor's caller");
     }
 
-    function test_deployScriptZeroFeeRecipientMeansTheDeployer() public {
+    function test_deployScriptZeroFeeRecipientMeansTheDeployerOutsideALaunch() public {
         DeployIdentityToken script = new DeployIdentityToken();
         IdentityToken deployed = script.deploy(
             DeployIdentityToken.Config({
@@ -472,6 +684,16 @@ contract IdentityTokenTest is Test {
             })
         );
         assertEq(deployed.feeRecipient(), address(script));
+    }
+
+    function test_RevertWhen_deployScriptHasFactoryButNoFeeRecipient() public {
+        DeployIdentityToken script = new DeployIdentityToken();
+        vm.expectRevert(IdentityToken.InvalidFeeRecipient.selector);
+        script.deploy(
+            DeployIdentityToken.Config({
+                factory: address(factory), poolManager: POOL_MANAGER, launchNumber: LAUNCH, feeRecipient: address(0)
+            })
+        );
     }
 
     // ---------------------------------------------------------------------------------------------

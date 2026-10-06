@@ -24,7 +24,8 @@ contract DeployIdentityToken is Script {
 
     /// @notice Reads the configuration from the environment and broadcasts the deployment.
     /// @dev Env: ID_FACTORY, ID_POOL_MANAGER, ID_LAUNCH_NUMBER, ID_FEE_RECIPIENT (all optional; zero
-    ///      means "none", and a zero fee recipient means the broadcasting deployer).
+    ///      means "none"). A zero fee recipient means the broadcasting deployer, but only when
+    ///      ID_FACTORY is also zero: with a factory set the constructor requires an explicit recipient.
     function run() external returns (IdentityToken token) {
         Config memory config = Config({
             factory: vm.envOr("ID_FACTORY", address(0)),

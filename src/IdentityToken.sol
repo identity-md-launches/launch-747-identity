@@ -25,6 +25,11 @@ interface ILaunchFactory {
 ///        - the fee recipient itself, so fees are never charged on their own collection.
 ///      When `factory` is a non-contract (a direct deployment with no launch) the distributor lookup
 ///      is skipped, and a factory that reverts or returns malformed data is treated as "no distributor".
+///
+///      Known limit of the PoolManager exemption: the PoolManager is permissionless, so any contract
+///      may move ID through it (sync/settle then take, or ERC-6909 claims) and both legs are exempt.
+///      The fee therefore applies to transfers that do not pass through the PoolManager; a fee on
+///      pool flows would need a pool hook, which is outside this token. See the README.
 contract IdentityToken {
     // ---------------------------------------------------------------------------------------------
     // ERC-20 metadata
@@ -52,8 +57,10 @@ contract IdentityToken {
     /// @notice The launch number used to look up the distributor on the factory.
     uint64 public immutable launchNumber;
 
-    /// @notice Where the 8% fee goes. Defaults to the deployer; the holder of this role may hand it on.
+    /// @notice Where the 8% fee goes. The holder of this role may hand it on in two steps.
     address public feeRecipient;
+    /// @notice The address proposed by `setFeeRecipient`; it takes the role by calling `acceptFeeRecipient`.
+    address public pendingFeeRecipient;
 
     // ---------------------------------------------------------------------------------------------
     // ERC-20 state
@@ -70,6 +77,7 @@ contract IdentityToken {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
     event FeePaid(address indexed from, address indexed to, uint256 fee);
+    event FeeRecipientProposed(address indexed currentRecipient, address indexed proposedRecipient);
     event FeeRecipientChanged(address indexed previousRecipient, address indexed newRecipient);
 
     error ERC20InvalidSender(address sender);
@@ -79,6 +87,7 @@ contract IdentityToken {
     error ERC20InsufficientBalance(address sender, uint256 balance, uint256 needed);
     error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed);
     error NotFeeRecipient(address caller);
+    error NotPendingFeeRecipient(address caller);
     error InvalidFeeRecipient();
 
     // ---------------------------------------------------------------------------------------------
@@ -88,12 +97,16 @@ contract IdentityToken {
     /// @param factory_ The launch factory to exempt (address(0) for a deployment outside a launch).
     /// @param poolManager_ The Uniswap v4 PoolManager to exempt (address(0) if none).
     /// @param launchNumber_ The launch number whose distributor is exempt (0 if none).
-    /// @param feeRecipient_ Who receives the 8% fee. address(0) means the deployer (`msg.sender`).
+    /// @param feeRecipient_ Who receives the 8% fee. Outside a launch (`factory_ == address(0)`)
+    ///        address(0) means the deployer (`msg.sender`). Under a launch the deployer is the factory
+    ///        contract, which could neither spend fees nor hand the role on, so a non-zero recipient
+    ///        (the requester's wallet) is required and the constructor reverts otherwise.
     constructor(address factory_, address poolManager_, uint64 launchNumber_, address feeRecipient_) {
         factory = factory_;
         poolManager = poolManager_;
         launchNumber = launchNumber_;
 
+        if (factory_ != address(0) && feeRecipient_ == address(0)) revert InvalidFeeRecipient();
         address recipient = feeRecipient_ == address(0) ? msg.sender : feeRecipient_;
         feeRecipient = recipient;
         emit FeeRecipientChanged(address(0), recipient);
@@ -107,13 +120,26 @@ contract IdentityToken {
     // Fee administration
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice Hands the fee stream to a new address. Only the current recipient may call.
-    /// @dev This changes where future fees go; it cannot touch any balance.
+    /// @notice Proposes a new fee recipient. Only the current recipient may call; the proposal takes
+    ///         effect when `newRecipient` calls `acceptFeeRecipient`. A later proposal replaces an
+    ///         earlier one.
+    /// @dev Two steps, so a mistyped address or a contract that cannot call back cannot strand the
+    ///      stream: until the proposed address accepts, fees keep going to the current recipient.
+    ///      This changes where future fees go; it cannot touch any balance.
     function setFeeRecipient(address newRecipient) external {
         if (msg.sender != feeRecipient) revert NotFeeRecipient(msg.sender);
         if (newRecipient == address(0)) revert InvalidFeeRecipient();
-        emit FeeRecipientChanged(feeRecipient, newRecipient);
-        feeRecipient = newRecipient;
+        pendingFeeRecipient = newRecipient;
+        emit FeeRecipientProposed(msg.sender, newRecipient);
+    }
+
+    /// @notice Completes a hand-off proposed by `setFeeRecipient`. Only the proposed address may call.
+    function acceptFeeRecipient() external {
+        address pending = pendingFeeRecipient;
+        if (pending == address(0) || msg.sender != pending) revert NotPendingFeeRecipient(msg.sender);
+        emit FeeRecipientChanged(feeRecipient, msg.sender);
+        feeRecipient = msg.sender;
+        pendingFeeRecipient = address(0);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -146,7 +172,11 @@ contract IdentityToken {
         if (factory_.code.length == 0) return address(0);
         (bool ok, bytes memory data) = factory_.staticcall(abi.encodeCall(ILaunchFactory.distributorOf, (launchNumber)));
         if (!ok || data.length != 32) return address(0);
-        return abi.decode(data, (address));
+        // Decode as a word and range-check it: `abi.decode(data, (address))` reverts on a word with
+        // non-zero upper bits, and a lookup failure must never brick transfers.
+        uint256 word = abi.decode(data, (uint256));
+        if (word > type(uint160).max) return address(0);
+        return address(uint160(word));
     }
 
     /// @notice True when a transfer between `from` and `to` moves the whole amount.
