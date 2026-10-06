@@ -9,7 +9,7 @@
       "$factory",
       "$poolManager",
       "$launchNumber",
-      "0x0000000000000000000000000000000000000000"
+      "0x70bcbde387539d95ffe6d43edbf7c6aa2da87a09"
     ],
     "totalSupply": "1000000000000000000000000000"
   },
@@ -21,5 +21,5 @@
     "initialPrice": "792281625142643375935439503360000"
   },
   "economics": {"poolBps":8000,"initialMarketCapWei":"10000000000000000000","remainderTo":"0x70bcbde387539d95ffe6d43edbf7c6aa2da87a09"},
-  "notes": "IdentityToken mints 1,000,000,000 ID with 18 decimals once to msg.sender in its constructor. The zero feeRecipient argument selects msg.sender, which is the factory during this launch, to receive the 8% fee on ordinary transfers, rounded down and deducted from the transferred amount. Transfers involving the factory, pool manager, current fee recipient, or distributor resolved through factory.distributorOf(launchNumber) are fee-exempt. Only the current fee recipient can change the fee recipient. There are no additional application contracts or initialization calls. Native ETH is currency0 and ID is currency1; initialPrice records sqrt(totalSupply / initialMarketCapWei) * 2^96. This price is provenance only; the deployer derives the opening price from the supplied economics and totalSupply."
+  "notes": "IdentityToken(address factory_, address poolManager_, uint64 launchNumber_, address feeRecipient_) mints 1,000,000,000 ID with 18 decimals once to msg.sender, the factory, in its constructor. The fourth argument is the requester's wallet, the same address as economics.remainderTo: it receives the 8% fee on ordinary transfers, rounded down and deducted from the transferred amount. Under a launch the constructor reverts on a zero fee recipient, because the deployer is the factory contract and could neither spend fees nor hand the role on. Transfers from or to the factory, the pool manager, the current fee recipient, or the distributor resolved through factory.distributorOf(launchNumber) at transfer time are fee-exempt, so the swarm's share, claims, the seed and swaps move whole. Only the current fee recipient can propose a new recipient, who must accept in a second step; nothing can mint, burn, pause, blacklist, freeze or move a holder's balance. There are no additional application contracts or initialization calls. Native ETH is currency0 and ID is currency1; initialPrice records sqrt(totalSupply / initialMarketCapWei) * 2^96. This price is provenance only; the deployer derives the opening price from the supplied economics and totalSupply."
 }
